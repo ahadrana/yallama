@@ -1,11 +1,12 @@
 from pathlib import Path
+from typing import Tuple
 import os,sys,math
 import pprint
 from dataclasses import dataclass
 from typing import (Optional,Generator)
 import contextlib
 import torch
-from torch import nn
+from torch import nn, Tensor
 from sentencepiece import SentencePieceProcessor
 from safetensors.torch import load_model, safe_open
 from tqdm import tqdm
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from debug import save_tensor
 import matplotlib.pyplot as plt
 import numpy as np
+
 
 
 
@@ -216,9 +218,9 @@ class LLaMA(nn.Module):
         self.lm_head = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.pad_id = model_args.pad_id
         
-    def forward(self,tokens: torch.Tensor, start_pos: int):
+    def forward(self,tokens: Tensor, input_pos: Optional[Tensor] = None):
       # (B, Seq_Len) -> (B, Seq_Len, Dim)
-      outputs = self.model(tokens, start_pos)
+      outputs = self.model(tokens, input_pos)
       # (B, Seq_Len, Dim) -> (B, Seq_Len, Vocab_Size)
       logits = self.lm_head(outputs).float()
   
@@ -252,7 +254,7 @@ class LLaMA(nn.Module):
         # generate the first token by conditioning on the input prompt
         next_token = self.generate_next_token(
             # from 0
-            0,
+            torch.arange(0, max_prompt_len, device=device),
             # tokens is already BxS
             tokens[:,:max_prompt_len],
             temperature=temperature,
@@ -263,9 +265,12 @@ class LLaMA(nn.Module):
         
         cur_iterator = tqdm(range(cur_pos, total_len), desc="Generating subsequent tokens")
         
+        input_pos = torch.tensor([cur_pos], device=device)
+        
         for cur_pos in cur_iterator:
-            next_token = self.generate_next_token(cur_pos,tokens[:,cur_pos:cur_pos+1],temperature=temperature,top_k=top_k)
+            next_token = self.generate_next_token(input_pos,tokens[:,cur_pos:cur_pos+1],temperature=temperature,top_k=top_k)
             tokens[:, cur_pos] = next_token
+            input_pos += 1
             # EOS is reached only if we found an EOS token for a padding position
             eos_reached |= (~prompt_tokens_mask[:, cur_pos]) & (next_token == self.tokenizer.eos_id)
             if all(eos_reached):
@@ -308,7 +313,7 @@ class LLaMA(nn.Module):
       return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
     @staticmethod
-    def sample(logits: torch.Tensor, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.Tensor:
+    def sample(logits: Tensor, temperature: float = 1.0, top_k: Optional[int] = None) -> Tensor:
         # scale the logits based on temperature
         logits = logits / max(temperature, 1e-5)
 
@@ -331,15 +336,18 @@ class LLaMA(nn.Module):
 
     def generate_next_token(
         self,
-        start_pos: int,
-        x: torch.Tensor,
+        input_pos: Optional[Tensor],
+        x: Tensor,
         temperature: float = 1.0,
         top_k: Optional[int] = None
-    ) -> torch.Tensor:
+    ) -> Tensor:
         # x: [B, S]
         # input_pos: [S]
+        
+        last_input_pos = input_pos.cpu()[-1].item()
+
         with torch.no_grad():
-          logits = self(x, start_pos)
+          logits = self(x, input_pos)
         
         logits = logits.cpu()
 
@@ -347,9 +355,7 @@ class LLaMA(nn.Module):
         # for sampling we extract the logits for the
         # last token and convert to shape: [v]
         logits = logits[0, -1]
-        # get the last index of the last dimension in the x tensor
-        last_index = x.shape[-1] - 1
-        save_tensor(logits, 0, f"logits_{last_index}")
+        save_tensor(logits, 0, f"logits_{last_input_pos}")
         
         # sample the next token
         token = LLaMA.sample(logits, temperature, top_k)
@@ -360,7 +366,7 @@ class LLaMA(nn.Module):
 @staticmethod
 # precompute positional frequencies for rotary embeddings
 # as defined in paragraph 3.2.2 of the paper - https://arxiv.org/pdf/2104.09864.pdf
-def precompute_theta_pos_frequencies(head_dim: int, seq_len: int,theta: float, device: str) -> torch.Tensor:
+def precompute_theta_pos_frequencies(head_dim: int, seq_len: int,theta: float, device: str) -> Tensor:
     # As written in the paragraph 3.2.2 of the paper
     # >> In order to generalize our results in 2D to any xi ∈ Rd where **d is even**, [...]
     assert head_dim % 2 == 0, "Dimension must be divisible by 2"
@@ -381,7 +387,14 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int,theta: float, d
     return freqs_complex
 
 @staticmethod
-def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
+def apply_rotary_embeddings(x: Tensor, input_pos: Optional[Tensor],freqs_complex: Tensor, device: str):
+    _, seq_len, _ = x.shape  # (B, Seq_Len, Dim)
+
+    
+    # input_pos determines if we are in inference or training mode
+    # if input_pos is specified, x is relative pos 
+    freqs_complex = freqs_complex[:seq_len] if input_pos is None else freqs_complex[input_pos]
+    
     # Separate the last dimension pairs of two values, representing the real and imaginary parts of the complex number
     # Two consecutive values will become a single complex number
     # (B, Seq_Len, H, Head_Dim) -> (B, Seq_Len, H, Head_Dim/2)
@@ -410,7 +423,7 @@ class Transformer(nn.Module):
     
     self.layers = nn.ModuleList()
     for i in range(model_args.n_layers):
-      self.layers.append(TransformerBlock(model_args, max_context))
+      self.layers.append(TransformerBlock(model_args, max_context,relative_index=i))
       
     self.norm = RMSNorm(model_args.dim, model_args.norm_eps)
     
@@ -421,32 +434,25 @@ class Transformer(nn.Module):
     if not model_args.use_sdpa:
       # do it the karpathy way
       print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-      # create a mask for causal attention
-      self.register_buffer("bias",torch.tril(torch.ones(max_context, max_context, dtype=torch.bool))
-                          .view(1, 1, max_context, max_context))        
+    # create a mask for causal attention
+    self.bias = torch.tril(torch.ones(max_context, max_context, dtype=torch.bool)).to(model_args.device)
 
-  def forward(self, tokens: torch.Tensor, start_pos: int):
-    # if not using sdpa and training
-    # we want
-    # we want
-    
+  def forward(self, tokens: Tensor, input_pos: Optional[Tensor] = None):
     # (B, Seq_Len)
     batch_size, seq_len = tokens.shape
 
     # (B, Seq_Len) -> (B, Seq_Len, Dim)
     h = self.embed_tokens(tokens)
-
     
-    # establish mask for non-sdpa attention 
-    mask = self.bias if not self.model_args.use_sdpa else None
+    # establish mask
+    mask = self.bias[None,None,input_pos]
       
     # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
-    assert start_pos + seq_len <= self.max_context * 2, f"start_pos + seq_len must be less than or equal to {self.max_context * 2}"
-    freqs_complex = self.freqs_cis[start_pos:start_pos + seq_len]
+    assert torch.all(input_pos <= self.max_context * 2), f"start_pos + seq_len must be less than or equal to {self.max_context * 2}"
     
     # Consecutively apply all the encoder layers
     for layer in self.layers:
-        h = layer(h,start_pos, freqs_complex, mask)
+        h = layer(h,input_pos, self.freqs_cis, mask)
     h = self.norm(h)
     
     return h
@@ -458,14 +464,14 @@ class RMSNorm(nn.Module):
         # The gamma parameter is learned
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x: torch.Tensor):
+    def _norm(self, x: Tensor):
         # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
         # rsqrt: 1 / sqrt(x)
         x_fp32 = x.float()
         x_normed = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
         return x_normed.type_as(x)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: Tensor):
         # Broadcast Dim across the last dimension
         # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
         x_= self.weight * self._norm(x)
@@ -473,24 +479,81 @@ class RMSNorm(nn.Module):
         return x_
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs,max_context:int):
+    def __init__(self, args: ModelArgs,max_context:int, relative_index:int = 0):
         super().__init__()
         
         self.self_attn = SelfAttention(args, max_context)
         self.mlp = FeedForward(args) 
         self.input_layernorm = RMSNorm(args.dim, args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, args.norm_eps)
+        self.relative_index = relative_index
         
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, x: Tensor, input_pos: Optional[Tensor], freqs_complex: Tensor, mask: Optional[Tensor] = None):
         batch_size, seq_len, _ = x.shape  # (B, Seq_Len, Dim)
+        last_input_pos = input_pos.cpu()[-1].item()
+
 
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         x_norm = self.input_layernorm(x)
-        h = x + self.self_attn.forward(x_norm, start_pos, freqs_complex,mask)
+        attn_out = self.self_attn.forward(x_norm, input_pos, freqs_complex,mask,relative_index=self.relative_index)
+        if last_input_pos == 3:
+            attn_out_debug = attn_out.flatten()
+            save_tensor(attn_out_debug, 0, f"attn_pre_res_{self.relative_index}_{last_input_pos}")
+        
+        h = x + attn_out
+        if last_input_pos == 3:
+            h_debug = h.flatten()
+            save_tensor(h_debug, 0, f"attn_post_res_{self.relative_index}_{last_input_pos}")
+        
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         out = h + self.mlp.forward(self.post_attention_layernorm(h))
+        
+        if last_input_pos == 3:
+          out_debug = out.flatten()
+          save_tensor(out_debug, 0, f"tblock_out_{self.relative_index}_{last_input_pos}")
+                
         return out
 
+
+class KVCache(nn.Module):
+  """
+  KVCache implentation based on torchtune. We can cache up to max_batch_size sequences
+    (One cache per AttentionBlock)
+  
+    Args:
+        max_batch_size (int): maximum batch size model will be run with
+        max_seq_len (int): maximum sequence length model will be run with
+        num_heads (int): number of heads. NOTE: we use num_kv_heads
+            and expand the kv's to have the same shape 
+            as q in the forward pass to save memory.
+        head_dim (int): per-attention head embedding dimension
+        dtype (torch.dtype): dtype for the caches
+  
+  """
+
+  def __init__(self, max_batch_size:int, max_seq_len:int, num_kv_heads:int, head_dim:int, dtype:torch.dtype):
+    super().__init__()
+    cache_shape = (max_batch_size, max_seq_len, num_kv_heads, head_dim)
+    self.register_buffer(
+        "k_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+    )
+    self.register_buffer(
+        "v_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+    )
+    self.max_batch_size = max_batch_size
+    
+    def update(self, input_pos, k_val, v_val) -> Tuple[Tensor, Tensor]:
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == k_val.shape[2]
+
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
+
+        return k_out, v_out
+    
+  
 
 class SelfAttention(nn.Module):
     def __init__(self, args: ModelArgs, max_context: int):
@@ -509,13 +572,14 @@ class SelfAttention(nn.Module):
         self.v_proj = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_context_size, self.n_kv_heads, self.head_dim)).to(device)
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_context_size, self.n_kv_heads, self.head_dim)).to(args.device)
+        # TODO: Make dtype configurable via ModelArgs 
+        self.kv_cache = KVCache(args.max_batch_size, args.max_context_size, self.n_kv_heads, self.head_dim, torch.bfloat16)
 
-    def forward(self,x: torch.Tensor,start_pos: int,freqs_complex: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self,x: Tensor,input_pos: Optional[Tensor],freqs_complex: Tensor, mask: Optional[Tensor] = None, relative_index:int = 0):
       
         # we rely on kv cache and hence seq_len should normally be 1
         batch_size, seq_len, _ = x.shape  # (B, Seq_Len, Dim)
+        last_input_pos = input_pos.cpu()[-1].item()
 
         # (B, Seq_Len , Dim) -> (B, Seq_Len, H_Q * Head_Dim)
         xq = self.q_proj(x)
@@ -532,22 +596,32 @@ class SelfAttention(nn.Module):
         xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
 
         # (B, Seq_Len, H_Q, Head_Dim) --> (B, Seq_Len, H_Q, Head_Dim)
-        xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
+        xq = apply_rotary_embeddings(xq, input_pos,freqs_complex, device=x.device)
         # (B, Seq_Len, H_KV, Head_Dim) --> (B, Seq_Len, H_KV, Head_Dim)
-        xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
+        xk = apply_rotary_embeddings(xk, input_pos,freqs_complex, device=x.device)
+        
+        if last_input_pos == 3:
+          xq_flattened = xq.flatten()
+          save_tensor(xq_flattened, 0, f"xq_{relative_index}_{last_input_pos}")
+        
 
-        # Replace the entry in the cache
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
+        # Replace entries in the cache
+        if self.kv_cache is not None:
+          # (B, Seq_Len, H_Q, Head_Dim) --> (B, MAX_SEQ_LEN, H_KV, Head_Dim)
+          keys,values = self.kv_cache.update(input_pos, xk, xv)
 
         # get the seq_len sized tensor from the cache
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        values = self.cache_v[:batch_size, : start_pos + seq_len]
+        if not self.model_args.use_sdpa:
+          # (B, MAX_SEQ_LEN, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_KV, Head_Dim)
+          keys = self.cache_k[:batch_size, : input_pos[-1]]
+          # (B, MAX_SEQ_LEN, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_KV, Head_Dim)
+          values = self.cache_v[:batch_size, : input_pos[-1]]
+          
 
         # Since every group of Q shares the same K and V heads, 
-        # just repeat the K and V heads for every Q in the same group.
+        # and we cache only kv_head*head_dim tensors,
+        # expand the K and V heads for every Q in the same group
+        # prior to attention computation
         
         # (B, Seq_Len_KV, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_Q, Head_Dim)
         keys = repeat_kv(keys, self.n_rep)
@@ -561,11 +635,27 @@ class SelfAttention(nn.Module):
         # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
         values = values.transpose(1, 2)
         
+        if last_input_pos == 3:
+
+          if self.model_args.use_sdpa:    
+            keys_flattened = keys[:,:,:last_input_pos + 1].flatten()
+            values_flattened = values[:,:,:last_input_pos + 1].flatten()
+          else:
+            keys_flattened = keys.flatten()
+            values_flattened = values.flatten()
+            
+          
+          save_tensor(keys_flattened, 0, f"keys_{relative_index}_{last_input_pos}")
+          save_tensor(values_flattened, 0, f"values_{relative_index}_{last_input_pos}")
         
         if self.model_args.use_sdpa:
           # use efficient self attention (flash-attention 2 on CUDA at least)
           # TODO: add dropout
-           output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=None, dropout_p=0, is_causal=True)
+           output = torch.nn.functional.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0, is_causal=False)
+           if last_input_pos == 3:
+              output_flattened = output.flatten()
+              save_tensor(output_flattened, 0, f"sdpa_{relative_index}_{last_input_pos}")
+          
         else:
           # (B, H_Q, Seq_Len, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q,  Seq_Len, Seq_Len_KV)
           scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -585,12 +675,12 @@ class SelfAttention(nn.Module):
         # (B, Seq_Len, Dim) -> (B, Seq_Len, Dim)
         output = self.o_proj(output) 
         
-        output_debug = output.flatten()
-        save_tensor(output_debug, 0, f"attn_output_{0}_{seq_len - 1}")
+        #output_debug = output.flatten()
+        #save_tensor(output_debug, 0, f"attn_output_{0}_{seq_len - 1}")
         
         return output
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -635,7 +725,7 @@ class FeedForward(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, args.dim, bias=False)
         self.up_proj = nn.Linear(args.dim, hidden_dim, bias=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: Tensor):
         # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
         swish = F.silu(self.gate_proj(x))
         # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
